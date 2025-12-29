@@ -3,220 +3,223 @@ import pandas as pd
 import joblib
 import os
 import time
-from datetime import datetime
+from xgboost import XGBClassifier
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
 from filelock import FileLock
-
-# --- IMPORT PIPELINE FUNCTIONS ---
 from utils.preprocessing import preprocess
 from drift.drift_detector import detect_drift
-from retrain.retrain import retrain
 
 # --- CONFIGURATION ---
 DATA_DIR = "data"
-MODEL_PATH = "model/current_model.pkl"
-REF_DATA_PATH = "data/reference_data.csv"
-INCOMING_DATA_PATH = "data/incoming_data.csv"
-LOCK_PATH = "data/incoming_data.csv.lock"
+MODEL_DIR = "model"
+MODEL_PATH = os.path.join(MODEL_DIR, "current_model.pkl")
+REF_DATA_PATH = os.path.join(DATA_DIR, "reference_data.csv")
+INCOMING_DATA_PATH = os.path.join(DATA_DIR, "incoming_data.csv")
+LOCK_PATH = os.path.join(DATA_DIR, "system.lock")
+ADMIN_PASSWORD = "admin123"  # 🔒 Simple Auth Password
 
-st.set_page_config(page_title="ML Drift Pipeline", layout="wide")
+# Ensure directories exist
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
 
-# --- SESSION STATE ---
-if "logs" not in st.session_state:
-    st.session_state.logs = []
+st.set_page_config(page_title="Drift Battle v3.0", layout="wide", page_icon="🛡️")
 
-def add_log(message):
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    st.session_state.logs.append(f"[{timestamp}] {message}")
+# --- UTILS ---
+if "logs" not in st.session_state: st.session_state.logs = []
+if "history" not in st.session_state: st.session_state.history = pd.DataFrame(columns=["Batch", "Accuracy", "Model_Type"])
+if "admin_logged_in" not in st.session_state: st.session_state.admin_logged_in = False
 
-def safe_log_data(df):
-    """Safely appends data to CSV using a FileLock."""
-    lock = FileLock(LOCK_PATH)
-    try:
-        with lock.acquire(timeout=5):
-            if not os.path.exists(INCOMING_DATA_PATH):
-                df.to_csv(INCOMING_DATA_PATH, index=False)
-            else:
-                df.to_csv(INCOMING_DATA_PATH, mode='a', header=False, index=False)
-    except TimeoutError:
-        st.error("Could not acquire lock to save data.")
+def log(msg):
+    st.session_state.logs.append(f"{time.strftime('%H:%M:%S')} - {msg}")
 
-def reset_system():
-    if os.path.exists(INCOMING_DATA_PATH):
-        os.remove(INCOMING_DATA_PATH)
-        if os.path.exists(REF_DATA_PATH):
-            ref_cols = pd.read_csv(REF_DATA_PATH, nrows=0).columns.tolist()
-            pd.DataFrame(columns=ref_cols).to_csv(INCOMING_DATA_PATH, index=False)
-    st.session_state.logs = []
-    add_log("System reset. Ready.")
+def is_system_ready():
+    """Checks if base model and ref data exist."""
+    return os.path.exists(MODEL_PATH) and os.path.exists(REF_DATA_PATH)
 
-# --- SIDEBAR ---
-with st.sidebar:
-    st.title("⚙ Control Panel")
-    
-    st.subheader("Batch Settings")
-    batch_size = st.number_input(
-        "Batch Size (Drift Check Interval)", 
-        min_value=1, 
-        value=100, 
-        step=10,
-        help="How many rows to process before checking for drift."
-    )
-    
-    st.divider()
-    if st.button("Reset System Data"):
-        reset_system()
-        st.rerun()
+def save_incoming_data(new_df):
+    """
+    Appends new inputs to the permanent incoming_data.csv log.
+    Handles file locking to prevent write conflicts.
+    """
+    lock = FileLock(f"{INCOMING_DATA_PATH}.lock")
+    with lock.acquire(timeout=10):
+        # Check if file exists to determine if we need a header
+        header = not os.path.exists(INCOMING_DATA_PATH)
+        new_df.to_csv(INCOMING_DATA_PATH, mode='a', header=header, index=False)
 
-# --- MAIN UI ---
-st.title("🚀 Automated Drift Detection & Retraining")
+def train_candidate(X, y):
+    model = XGBClassifier(eval_metric="logloss", use_label_encoder=False)
+    model.fit(X, y)
+    return model
 
-# Create Tabs
-tab_batch, tab_manual = st.tabs(["📂 Batch Stream (CSV)", "✍ Manual Input"])
+# --- TABS ---
+tab_user, tab_admin = st.tabs(["👤 User Simulation", "🔒 Admin Panel"])
 
 # ==========================================
-# TAB 1: BATCH PROCESSING (The Simulation)
+# 👤 USER SIMULATION (LOCKED IF NOT READY)
 # ==========================================
-with tab_batch:
-    st.markdown(f"**Status:** Ready to process stream in batches of **{batch_size}**.")
+with tab_user:
+    st.header("⚔️ Model Drift Simulation")
+
+    # 🛑 1. SYSTEM READINESS CHECK
+    if not is_system_ready():
+        st.error("🚫 SYSTEM LOCKED")
+        st.warning("The AI System has not been initialized yet. Please ask an Administrator to log in and upload the base model.")
+        st.stop()  # Stops the rest of the code in this tab from running
+
+    # ... If we pass the check, show the UI ...
     
-    uploaded_file = st.file_uploader("Upload Incoming Data CSV", type=["csv"], key="batch_upload")
-
-    if uploaded_file and st.button("Start Batch Processing"):
-        try:
-            # --- RESET LOGS AT START OF RUN ---
-            st.session_state.logs = [] 
-            add_log("--- NEW BATCH PROCESS STARTED ---")
-            
-            df_stream = pd.read_csv(uploaded_file)
-            total_rows = len(df_stream)
-            has_labels = "label" in df_stream.columns
-            
-            add_log(f"File loaded: {total_rows} rows.")
-            if has_labels:
-                add_log("✅ Labels found: Auto-Retraining ENABLED.")
-            else:
-                add_log("❌ No Labels: Drift Detection ONLY.")
-            
-            # UI Elements for Loop
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            log_display = st.empty()
-            
-            # Ensure file exists
-            if not os.path.exists(INCOMING_DATA_PATH):
-                df_stream.iloc[:0].to_csv(INCOMING_DATA_PATH, index=False)
-
-            # Processing Loop
-            for start_idx in range(0, total_rows, batch_size):
-                end_idx = min(start_idx + batch_size, total_rows)
-                batch = df_stream.iloc[start_idx:end_idx]
-                
-                # 1. Save Batch
-                safe_log_data(batch)
-                
-                # 2. Check Drift
-                status_text.text(f"Processing rows {start_idx} to {end_idx}...")
-                drifted_cols = detect_drift(REF_DATA_PATH, INCOMING_DATA_PATH)
-                
-                if drifted_cols:
-                    add_log(f"⚠ Drift Detected in: {drifted_cols}")
-                    
-                    if has_labels:
-                        add_log("🔄 Initiating Auto-Retraining...")
-                        result = retrain()
-                        
-                        if result:
-                            if result['status'] == 'replaced':
-                                add_log(f"✅ SUCCESS: Model Retrained. New Acc: {result['accuracy']}")
-                            elif result['status'] == 'skipped':
-                                add_log(f"ℹ Retrain Skipped: {result['reason']}")
-                        else:
-                            add_log("ℹ Retrain Skipped: Insufficient data.")
-                    else:
-                        add_log("🛑 Drift ignored: No ground truth.")
-                
-                # Update UI
-                progress_bar.progress(end_idx / total_rows)
-                # Show last 10 logs so user sees activity flowing
-                log_display.code("\n".join(st.session_state.logs[-10:]), language="text")
-                time.sleep(0.1)
-
-            status_text.text("Processing Complete!")
-            st.success("Batch processing finished.")
-            
-        except Exception as e:
-            st.error(f"Error: {e}")
-            add_log(f"ERROR: {e}")
-
-# ==========================================
-# TAB 2: MANUAL INPUT (Single Prediction)
-# ==========================================
-with tab_manual:
-    st.markdown("**Test the model with single manual entries.**")
-    
-    try:
-        model = joblib.load(MODEL_PATH)
-    except:
-        st.warning("Model not found. Run initial training first.")
-        model = None
-
-    col1, col2 = st.columns(2)
-    
+    col1, col2 = st.columns([2, 1])
     with col1:
-        if os.path.exists(REF_DATA_PATH):
-            ref_df = pd.read_csv(REF_DATA_PATH, nrows=1)
-            feature_cols = [c for c in ref_df.columns if c != 'label']
-            
-            user_input = st.text_input(
-                f"Enter {len(feature_cols)} features (comma separated)",
-                placeholder="e.g., 0.5, 12.0, 3.5..."
-            )
-        else:
-            st.error("Reference data not found.")
-            feature_cols = []
-            user_input = ""
-
+        uploaded_file = st.file_uploader("Upload Stream Data (CSV)", type="csv")
     with col2:
-        true_label = st.selectbox("Ground Truth Label (Optional)", [None, 0, 1, 2])
+        chunk_size = st.number_input("Batch Size", min_value=50, value=500, step=50)
 
-    if st.button("Predict & Log"):
-        # Reset logs if they are getting too long or if switching context
-        if len(st.session_state.logs) > 50:
-             st.session_state.logs = []
-        
-        if model and user_input:
-            try:
-                values = [float(x.strip()) for x in user_input.split(",")]
-                if len(values) != len(feature_cols):
-                    st.error(f"Expected {len(feature_cols)} values, got {len(values)}.")
-                else:
-                    input_df = pd.DataFrame([values], columns=feature_cols)
-                    X_input = preprocess(input_df)
-                    pred = model.predict(X_input)[0]
-                    
-                    st.info(f"🤖 Model Prediction: **{pred}**")
-                    
-                    if true_label is not None:
-                        input_df['label'] = true_label
-                        safe_log_data(input_df)
-                        add_log(f"✍ Manual Entry Logged. Label: {true_label}")
-                        st.success("Data logged to system.")
-                        
-                        drifted = detect_drift(REF_DATA_PATH, INCOMING_DATA_PATH)
-                        if drifted:
-                            add_log(f"⚠ Drift Detected after manual entry.")
-                            st.warning("Drift detected! (Run batch process to retrain)")
-                    else:
-                        add_log("Prediction made (Data not logged - No Label).")
-                        
-                    st.code("\n".join(st.session_state.logs[-5:]), language="text")
-
-            except Exception as e:
-                st.error(f"Error parsing input: {e}")
-
-# --- DOWNLOAD LOGS ---
-if st.session_state.logs:
+    # PLACEHOLDERS
     st.divider()
-    st.subheader("📋 Audit Logs")
-    full_log = "\n".join(st.session_state.logs)
-    st.download_button("Download Log File", full_log, "processing_log.txt", "text/plain")
+    chart_placeholder = st.empty()
+    battle_zone = st.container()
+
+    if uploaded_file and st.button("▶️ Start Simulation", type="primary"):
+        # Reset Session
+        st.session_state.logs = []
+        st.session_state.history = pd.DataFrame(columns=["Batch", "Accuracy", "Model_Type"])
+
+        # Load & PERSIST Data
+        df_stream = pd.read_csv(uploaded_file)
+        
+        # 💾 LOGGING: Append to permanent history immediately
+        save_incoming_data(df_stream)
+        log(f"💾 Data Logged: {len(df_stream)} rows appended to {INCOMING_DATA_PATH}")
+
+        # Load System Resources
+        model = joblib.load(MODEL_PATH)
+        current_model = model
+        
+        # Progress Bar
+        progress_bar = st.progress(0)
+        total_chunks = len(df_stream) // chunk_size
+
+        # --- BATCH LOOP ---
+        for i, batch_start in enumerate(range(0, len(df_stream), chunk_size)):
+            chunk = df_stream.iloc[batch_start : batch_start + chunk_size].copy()
+            if len(chunk) < 50: break 
+
+            progress_bar.progress(min((i + 1) / total_chunks, 1.0))
+            
+            # Prepare Data
+            # Note: We reload ref_df inside loop or before loop to get features
+            ref_df = pd.read_csv(REF_DATA_PATH) 
+            feature_cols = [c for c in ref_df.columns if c != "label"]
+            
+            X_chunk = preprocess(chunk[feature_cols])
+            y_chunk = chunk['label']
+            
+            # 1. Performance Check
+            curr_acc = accuracy_score(y_chunk, current_model.predict(X_chunk))
+            
+            # Update Chart
+            new_row = pd.DataFrame([{"Batch": i, "Accuracy": curr_acc}])
+            st.session_state.history = pd.concat([st.session_state.history, new_row], ignore_index=True)
+            with chart_placeholder:
+                st.line_chart(st.session_state.history, x="Batch", y="Accuracy")
+
+            # 2. Drift Check
+            temp_path = f"data/temp_batch_{int(time.time())}.csv"
+            chunk.to_csv(temp_path, index=False)
+            drifted_cols = detect_drift(REF_DATA_PATH, temp_path)
+            if os.path.exists(temp_path): os.remove(temp_path)
+
+            if drifted_cols:
+                log(f"⚠️ Batch {i}: Drift Detected in {len(drifted_cols)} features")
+                
+                with battle_zone:
+                    # BATTLE LOGIC
+                    X_train, X_test, y_train_true, y_test_true = train_test_split(X_chunk, y_chunk, test_size=0.2)
+                    
+                    # Candidate A (Pseudo)
+                    pseudo_labels = current_model.predict(X_train)
+                    model_a = train_candidate(X_train, pseudo_labels)
+                    acc_a = accuracy_score(y_test_true, model_a.predict(X_test))
+                    
+                    # Candidate B (True)
+                    model_b = train_candidate(X_train, y_train_true)
+                    acc_b = accuracy_score(y_test_true, model_b.predict(X_test))
+                    
+                    if acc_a > acc_b:
+                        current_model = model_a
+                        log(f"🏆 Batch {i}: Pseudo-Labels Won. Updating Model.")
+                    else:
+                        current_model = model_b
+                        log(f"🏆 Batch {i}: True Labels Won. Updating Model.")
+
+                    # Save winner
+                    joblib.dump(current_model, MODEL_PATH)
+            else:
+                log(f"✅ Batch {i}: Stable.")
+
+        progress_bar.empty()
+        st.success("Simulation & Logging Complete")
+
+    # Logs at bottom
+    with st.expander("Show Logs"):
+        for l in st.session_state.logs: st.text(l)
+
+
+# ==========================================
+# 🔒 ADMIN PANEL (AUTH REQUIRED)
+# ==========================================
+with tab_admin:
+    st.header("🔧 Administrator Panel")
+
+    # 🔐 AUTH CHECK
+    if not st.session_state.admin_logged_in:
+        password = st.text_input("Enter Admin Password", type="password")
+        if st.button("Login"):
+            if password == ADMIN_PASSWORD:
+                st.session_state.admin_logged_in = True
+                st.rerun()
+            else:
+                st.error("Incorrect Password")
+        st.stop() # Stop rendering admin controls if not logged in
+
+    # 🔓 LOGGED IN VIEW
+    st.success("🔓 Authenticated as Admin")
+    if st.button("Logout"):
+        st.session_state.admin_logged_in = False
+        st.rerun()
+        
+    st.divider()
+    st.subheader("System Initialization")
+    
+    ac1, ac2 = st.columns(2)
+    u_csv = ac1.file_uploader("Reference Data (CSV)", type="csv")
+    u_pkl = ac2.file_uploader("Base Model (PKL)", type="pkl")
+
+    if st.button("🚀 Initialize / Reset System"):
+        if u_csv and u_pkl:
+            lock = FileLock(LOCK_PATH)
+            with lock.acquire(timeout=10):
+                # Save Ref
+                df = pd.read_csv(u_csv)
+                df.to_csv(REF_DATA_PATH, index=False)
+                # Save Model
+                with open(MODEL_PATH, "wb") as f: f.write(u_pkl.getbuffer())
+                # Reset Preprocessor
+                preprocess(df.drop(columns=['label'], errors='ignore'), training=True)
+                # Clear old logs if resetting
+                if os.path.exists(INCOMING_DATA_PATH): os.remove(INCOMING_DATA_PATH)
+                
+                st.success("System Initialized! User Tab Unlocked.")
+        else:
+            st.error("Please upload both files.")
+
+    # Show Data Log Stats
+    if os.path.exists(INCOMING_DATA_PATH):
+        st.divider()
+        st.subheader("📊 Global Incoming Data Log")
+        hist_df = pd.read_csv(INCOMING_DATA_PATH)
+        st.write(f"Total Records Logged: **{len(hist_df)}**")
+        with st.expander("View Last 5 Rows"):
+            st.dataframe(hist_df.tail())
