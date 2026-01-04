@@ -84,9 +84,3 @@ The project includes an interactive **Streamlit application** that allows:
 - Git & GitHub
 
 ---
-
-## Why This Project Matters
-- Demonstrates **real-world ML deployment challenges**
-- Shows understanding of **MLOps, monitoring, and automation**
-- Goes beyond basic model training into **production ML systems**
-- Resume-ready project for **ML Engineer / MLOps / Data Science** roles
