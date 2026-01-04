@@ -70,12 +70,10 @@ The project includes an interactive **Streamlit application** that allows:
 - Observing retraining triggers and updated predictions
 
 🔗 **Live App Link:**  
-👉 _Add your deployed Streamlit / Hugging Face / Localhost link here_
 
-> Example: https://huggingface.co/spaces/your-username/model-drift-detector
+> Example: https://drift-detector-and-autotrainer.streamlit.app/
 
-📸 Screenshots of the app interface and drift visualization will be added here.
-
+📸app interface and drift visualization
 ---
 
 ## Tech Stack
